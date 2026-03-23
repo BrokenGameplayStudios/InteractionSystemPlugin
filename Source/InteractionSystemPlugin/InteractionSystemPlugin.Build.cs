@@ -25,7 +25,7 @@ public class InteractionSystemPlugin : ModuleRules
 		PublicDependencyModuleNames.AddRange(
 			new string[]
 			{
-				"Core",
+                "Core", "CoreUObject", "Engine", "InputCore", "UMG", "Slate", "SlateCore"
 				// ... add other public dependencies that you statically link with here ...
 			}
 			);

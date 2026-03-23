@@ -1,4 +1,5 @@
-// InteractComponent.cpp
+// UInteractComponent.cpp
+
 #include "InteractComponent.h"
 #include "InteractableComponent.h"
 #include "Kismet/KismetSystemLibrary.h"
@@ -9,69 +10,83 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
-#include "DrawDebugHelpers.h"  // For Debugging
 #include "CollisionQueryParams.h"
-#include "Engine/EngineTypes.h"
-#include "Net/UnrealNetwork.h"  // For net mode logging
-#include "GameFramework/Pawn.h"  // For APawn
+#include "Net/UnrealNetwork.h"
+#include "GameFramework/Pawn.h"
 
 UInteractComponent::UInteractComponent()
 {
     PrimaryComponentTick.bCanEverTick = true;
-    CachedPawnOwner = nullptr;
-    CachedCharacterOwner = nullptr;
-    CachedPlayerController = nullptr;
 }
 
 void UInteractComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    // Fallback cache
     AActor* OwnerActor = GetOwner();
     if (OwnerActor)
     {
         CachedPawnOwner = Cast<APawn>(OwnerActor);
         CachedCharacterOwner = Cast<ACharacter>(OwnerActor);
         if (CachedPawnOwner)
-        {
             CachedPlayerController = Cast<APlayerController>(CachedPawnOwner->GetController());
-        }
     }
 
-    if (!CachedPawnOwner || !CachedPlayerController)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("UInteractComponent fallback cache incomplete for owner %s. Call Initialize from BP."), *GetOwner()->GetName());
-    }
-    else
-    {
+    if (CachedPawnOwner && CachedPlayerController)
         bInitialized = true;
-    }
 }
 
 void UInteractComponent::Initialize(APlayerController* InPlayerController)
 {
     CachedPlayerController = InPlayerController;
-    if (CachedPlayerController)
-    {
-        bInitialized = true;
-        UE_LOG(LogTemp, Log, TEXT("UInteractComponent initialized with Controller for owner %s"), *GetOwner()->GetName());
+    if (CachedPlayerController) bInitialized = true;
+}
 
-        // Recache pawn if needed
-        AActor* OwnerActor = GetOwner();
-        CachedPawnOwner = Cast<APawn>(OwnerActor);
-        CachedCharacterOwner = Cast<ACharacter>(OwnerActor);
+FVector UInteractComponent::GetTraceStartLocation() const
+{
+    if (TraceSocketName != NAME_None && CachedPawnOwner)
+    {
+        USkeletalMeshComponent* Mesh = Cast<USkeletalMeshComponent>(CachedPawnOwner->GetComponentByClass(USkeletalMeshComponent::StaticClass()));
+        if (Mesh)
+            return Mesh->GetSocketLocation(TraceSocketName);
     }
+
+    if (CachedPlayerController && CachedPlayerController->PlayerCameraManager)
+        return CachedPlayerController->PlayerCameraManager->GetCameraLocation();
+
+    return CachedPawnOwner ? CachedPawnOwner->GetActorLocation() : FVector::ZeroVector;
+}
+
+bool UInteractComponent::HasLineOfSight(AActor* Target) const
+{
+    if (!Target || !bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return false;
+
+    FVector TraceStart = GetTraceStartLocation();
+    if (!CachedPlayerController || !CachedPlayerController->PlayerCameraManager) return false;
+
+    FVector Forward = CachedPlayerController->PlayerCameraManager->GetCameraRotation().Vector().GetSafeNormal();
+
+    TraceStart += Forward * 25.0f;
+
+    FVector TraceEnd = TraceStart + (Forward * MaxInteractionDistance);
+
+    FHitResult HitResult;
+    FCollisionQueryParams Params;
+    Params.AddIgnoredActor(GetOwner());
+    Params.bTraceComplex = true;
+
+    if (USkeletalMeshComponent* Mesh = Cast<USkeletalMeshComponent>(CachedPawnOwner->GetComponentByClass(USkeletalMeshComponent::StaticClass())))
+        Params.AddIgnoredComponent(Mesh);
+
+    return GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, InteractionTraceChannel, Params) &&
+        HitResult.GetActor() == Target;
 }
 
 void UInteractComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    if (!bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled())
-    {
-        return;
-    }
+    if (!bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return;
 
     if (GetWorld()->GetTimeSeconds() - LastDetectionTime >= DetectionInterval)
     {
@@ -89,7 +104,7 @@ void UInteractComponent::TickComponent(float DeltaTime, ELevelTick TickType, FAc
 
 void UInteractComponent::InteractPressed()
 {
-    if (!bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return;
+    if (!bInteractionEnabled || !bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return;
 
     if (FocusedInteractable)
     {
@@ -105,7 +120,7 @@ void UInteractComponent::InteractPressed()
 
 void UInteractComponent::InteractReleased()
 {
-    if (!bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return;
+    if (!bInteractionEnabled || !bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return;
 
     if (CurrentInteractableComponent.IsValid())
     {
@@ -115,63 +130,24 @@ void UInteractComponent::InteractReleased()
     }
 }
 
+void UInteractComponent::SetInteractionEnabled(bool bEnabled)
+{
+    bInteractionEnabled = bEnabled;
+}
+
 void UInteractComponent::Server_StartInteraction_Implementation(UInteractableComponent* TargetComponent)
 {
-    if (TargetComponent)
-    {
-        TargetComponent->StartInteraction(GetOwner());
-    }
+    if (TargetComponent) TargetComponent->StartInteraction(GetOwner());
 }
 
 void UInteractComponent::Server_CancelInteraction_Implementation(UInteractableComponent* TargetComponent)
 {
-    if (TargetComponent)
-    {
-        TargetComponent->CancelInteraction(GetOwner());
-    }
-}
-
-bool UInteractComponent::HasLineOfSight(AActor* Target) const
-{
-    if (!bInitialized || !CachedPawnOwner || !CachedPawnOwner->IsLocallyControlled()) return false;
-
-    if (!Target) return false;
-
-    AActor* OwnerActor = GetOwner();
-    if (!OwnerActor) return false;
-
-    FVector TraceStart = OwnerActor->GetActorLocation();
-    FRotator TraceRotation = OwnerActor->GetActorRotation();
-
-    USkeletalMeshComponent* Mesh = Cast<USkeletalMeshComponent>(OwnerActor->GetComponentByClass(USkeletalMeshComponent::StaticClass()));
-    if (Mesh && TraceSocketName != NAME_None)
-    {
-        TraceStart = Mesh->GetSocketLocation(TraceSocketName);
-        TraceRotation = Mesh->GetSocketRotation(TraceSocketName);
-    }
-
-    if (!CachedPlayerController || !CachedPlayerController->PlayerCameraManager) return false;
-    FVector CameraForward = CachedPlayerController->PlayerCameraManager->GetCameraRotation().Vector().GetSafeNormal();
-
-    FVector TraceEnd = TraceStart + (CameraForward * MaxInteractionDistance);
-
-    FHitResult HitResult;
-    ECollisionChannel TraceChannel = ECC_Visibility;
-    FCollisionQueryParams Params;
-    Params.AddIgnoredActor(OwnerActor);
-
-    bool bHit = GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, TraceChannel, Params);
-
-    return bHit && HitResult.GetActor() == Target;
+    if (TargetComponent) TargetComponent->CancelInteraction(GetOwner());
 }
 
 void UInteractComponent::PerformLOSCheck()
 {
-    if (!CurrentInteractableComponent.IsValid())
-    {
-        GetWorld()->GetTimerManager().ClearTimer(InteractionCheckTimer);
-        return;
-    }
+    if (!CurrentInteractableComponent.IsValid()) return;
 
     AActor* TargetActor = CurrentInteractableComponent->GetOwner();
     if (!HasLineOfSight(TargetActor))
@@ -193,8 +169,7 @@ void UInteractComponent::DetectNearbyInteractables()
     ObjectTypes.Add(UEngineTypes::ConvertToObjectType(ECC_WorldDynamic));
 
     UKismetSystemLibrary::SphereTraceMultiForObjects(GetWorld(), Location, Location, DetectionRadius,
-        ObjectTypes, false, { GetOwner() }, EDrawDebugTrace::None,
-        HitResults, true);
+        ObjectTypes, false, { GetOwner() }, EDrawDebugTrace::None, HitResults, true);
 
     for (const FHitResult& Hit : HitResults)
     {
@@ -216,9 +191,7 @@ void UInteractComponent::UpdateVisibleInteractables()
     for (AActor* Candidate : NearbyInteractables)
     {
         if (HasLineOfSight(Candidate))
-        {
             VisibleInteractables.Add(Candidate);
-        }
     }
 }
 
@@ -229,19 +202,18 @@ AActor* UInteractComponent::GetBestInteractable() const
 
     FVector ViewLocation;
     FRotator ViewRotation;
-    if (CachedCharacterOwner)
-    {
+    if (CachedPlayerController && CachedPlayerController->PlayerCameraManager)
+        CachedPlayerController->PlayerCameraManager->GetCameraViewPoint(ViewLocation, ViewRotation);
+    else if (CachedCharacterOwner)
         CachedCharacterOwner->GetActorEyesViewPoint(ViewLocation, ViewRotation);
-    }
     else if (CachedPawnOwner)
-    {
         CachedPawnOwner->GetActorEyesViewPoint(ViewLocation, ViewRotation);
-    }
     else
     {
         ViewLocation = GetOwner()->GetActorLocation();
         ViewRotation = GetOwner()->GetActorRotation();
     }
+
     FVector Forward = ViewRotation.Vector();
 
     for (AActor* Candidate : VisibleInteractables)
